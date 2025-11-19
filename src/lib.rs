@@ -1,11 +1,11 @@
 use std::{cell::RefCell, collections::{HashMap, HashSet}, rc::Rc, sync::{atomic::{AtomicU64, Ordering}, Arc}};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use mlua::prelude::*;
 use mlua::HookTriggers;
 use mlua::VmState;
 use mlua::Variadic;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Action {
     Save {
         name: String,
@@ -13,6 +13,7 @@ pub enum Action {
     },
     WriteParameter {
         parameter_name: String,
+        old_value: Option<f32>,
         new_value: Option<f32>,
     },
     CreateCase {
@@ -51,7 +52,7 @@ fn configure_lua_limits(lua: &Lua) -> LuaResult<()> {
 
 pub fn run_lua_with_data(
     code: &str,
-    data: std::collections::HashMap<String, Option<f32>>,
+    data: HashMap<String, Option<f32>>,
 ) -> LuaResult<(Vec<Action>, String)> {
     let actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(Vec::new()));
     let lua = Lua::new();
@@ -99,14 +100,14 @@ pub fn run_lua_with_data(
     }
 
     let globals = lua.globals();
-    for (key, val) in data.into_iter() {
+    for (key, val) in data.clone().into_iter() {
         match val {
             Some(f) => globals.set(key, f)?,
             None => globals.set(key, mlua::Value::Nil)?,
         }
     }
 
-    attach_action_functions(&lua, actions.clone())?;
+    attach_action_functions(&lua, actions.clone(), data)?;
 
     match lua.load(code).exec() {
         Ok(()) => {
@@ -170,7 +171,7 @@ pub fn run_lua_with_data_daily(
     }
 
     let globals = lua.globals();
-    for (key, series) in data.into_iter() {
+    for (key, series) in data.clone().into_iter() {
         let all_none = series.iter().all(|v| v.is_none());
         if all_none {
             globals.set(key, mlua::Value::Nil)?;
@@ -187,7 +188,15 @@ pub fn run_lua_with_data_daily(
         }
     }
 
-    attach_action_functions(&lua, actions.clone())?;
+    let last_values: HashMap<String, Option<f32>> = data
+        .iter()
+        .map(|(k, v)| {
+            let last = v.last().cloned().unwrap_or(None);
+            (k.clone(), last)
+        })
+        .collect();
+
+    attach_action_functions(&lua, actions.clone(), last_values)?;
 
     lua.load(code).exec()?;
 
@@ -197,7 +206,7 @@ pub fn run_lua_with_data_daily(
     Ok((actions, output))
 }
 
-fn attach_action_functions(lua: &Lua, actions: Rc<RefCell<Vec<Action>>>) -> LuaResult<()> {
+fn attach_action_functions(lua: &Lua, actions: Rc<RefCell<Vec<Action>>>, data: HashMap<String, Option<f32>>) -> LuaResult<()> {
     let globals = lua.globals();
 
     {
@@ -216,8 +225,9 @@ fn attach_action_functions(lua: &Lua, actions: Rc<RefCell<Vec<Action>>>) -> LuaR
         let write_parameter = lua.create_function(
             move |_, (parameter_name, new_value): (String, Option<f32>)| {
                 actions_clone.borrow_mut().push(Action::WriteParameter {
-                    parameter_name,
+                    parameter_name: parameter_name.clone(),
                     new_value,
+                    old_value: data.get(&parameter_name).cloned().flatten()
                 });
                 Ok(())
             },
@@ -317,10 +327,12 @@ mod tests {
                     Action::WriteParameter {
                         parameter_name: ap,
                         new_value: av,
+                        old_value: aov,
                     },
                     Action::WriteParameter {
                         parameter_name: ep,
                         new_value: ev,
+                        old_value: eov,
                     },
                 ) => {
                     assert_eq!(
@@ -334,6 +346,13 @@ mod tests {
                         i,
                         av,
                         ev
+                    );
+                    assert!(
+                        (aov.is_none() && eov.is_none()) || (aov.is_some() && eov.is_some() && aov == eov),
+                        "mismatch at index {}: WriteParameter.new_value: got {:?}, expected {:?}",
+                        i,
+                        aov,
+                        eov
                     );
                 }
 
@@ -379,7 +398,8 @@ mod tests {
             create_case("title-1", "desc-1")
         "#;
 
-        let data: HashMap<String, Option<f32>> = HashMap::new();
+        let mut data: HashMap<String, Option<f32>> = HashMap::new();
+        data.insert("p".to_string(), Some(2f32));
         let res = run_lua_with_data(code, data).expect("should run lua");
 
         let expected = vec![
@@ -388,8 +408,9 @@ mod tests {
                 value: Some(2.0),
             },
             Action::WriteParameter {
-                parameter_name: "p".to_string(),
-                new_value: Some(4.0),
+                parameter_name:"p".to_string(),
+                new_value: Some(4.0), 
+                old_value: Some(2.0) 
             },
             Action::CreateCase {
                 title: "title-1".to_string(),
