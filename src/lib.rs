@@ -53,6 +53,7 @@ fn configure_lua_limits(lua: &Lua) -> LuaResult<()> {
 pub fn run_lua_with_data(
     code: &str,
     data: HashMap<String, Option<f32>>,
+    metadata: HashMap<String, String>
 ) -> LuaResult<(Vec<Action>, String)> {
     let actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(Vec::new()));
     let lua = Lua::new();
@@ -106,6 +107,9 @@ pub fn run_lua_with_data(
             None => globals.set(key, mlua::Value::Nil)?,
         }
     }
+    for (key, val) in metadata.into_iter() {
+        globals.set(key, val)?
+    }
 
     attach_action_functions(&lua, actions.clone(), data)?;
 
@@ -123,6 +127,7 @@ pub fn run_lua_with_data(
 pub fn run_lua_with_data_daily(
     code: &str,
     data: HashMap<String, Vec<Option<f32>>>,
+    metadata: HashMap<String, String>
 ) -> LuaResult<(Vec<Action>, String)> {
     let actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(Vec::new()));
     let lua = Lua::new();
@@ -186,6 +191,9 @@ pub fn run_lua_with_data_daily(
             }
             globals.set(key, tbl)?;
         }
+    }
+    for (key, val) in metadata.into_iter() {
+        globals.set(key, val)?
     }
 
     let last_values: HashMap<String, Option<f32>> = data
@@ -399,8 +407,9 @@ mod tests {
         "#;
 
         let mut data: HashMap<String, Option<f32>> = HashMap::new();
+        let metadata: HashMap<String, String> = HashMap::new();
         data.insert("p".to_string(), Some(2f32));
-        let res = run_lua_with_data(code, data).expect("should run lua");
+        let res = run_lua_with_data(code, data, metadata).expect("should run lua");
 
         let expected = vec![
             Action::Save {
@@ -424,6 +433,7 @@ mod tests {
     #[test]
     fn test_run_lua_with_data_daily_tables_and_nil() {
         let mut daily: HashMap<String, Vec<Option<f32>>> = HashMap::new();
+        let metadata: HashMap<String, String> = HashMap::new();
         daily.insert("all_none".to_string(), vec![None, None, None]);
         daily.insert("series".to_string(), vec![None, Some(1.5), None]);
 
@@ -442,7 +452,7 @@ mod tests {
             end
         "#;
 
-        let res = run_lua_with_data_daily(code, daily).expect("should run daily lua");
+        let res = run_lua_with_data_daily(code, daily, metadata).expect("should run daily lua");
 
         let expected = vec![
             Action::Save {
@@ -470,7 +480,8 @@ mod tests {
         "#;
 
         let data: HashMap<String, Option<f32>> = HashMap::new();
-        let err = run_lua_with_data(code, data).unwrap_err();
+        let metadata: HashMap<String, String> = HashMap::new();
+        let err = run_lua_with_data(code, data, metadata).unwrap_err();
 
         let s = format!("{}", err);
         assert!(
@@ -490,7 +501,8 @@ mod tests {
         "#;
 
         let data: HashMap<String, Option<f32>> = HashMap::new();
-        let (res, stdout) = run_lua_with_data(code, data).expect("should run lua and return (actions, stdout)");
+        let metadata: HashMap<String, String> = HashMap::new();
+        let (res, stdout) = run_lua_with_data(code, data, metadata).expect("should run lua and return (actions, stdout)");
 
         let expected = vec![
             Action::Save {
