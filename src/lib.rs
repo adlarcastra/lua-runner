@@ -1,11 +1,73 @@
-use std::{cell::RefCell, collections::{HashMap, HashSet}, rc::Rc, sync::{atomic::{AtomicU64, Ordering}, Arc}};
-use serde::{Deserialize, Serialize};
-use mlua::prelude::*;
 use mlua::HookTriggers;
-use mlua::VmState;
 use mlua::Variadic;
+use mlua::VmState;
+use mlua::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
-#[derive(Debug, Serialize, Deserialize)]
+// --- Conditional Compilation Wrapper ---
+
+#[cfg(feature = "send")]
+use std::sync::Mutex;
+#[cfg(not(feature = "send"))]
+use std::{cell::RefCell, rc::Rc};
+
+#[derive(Clone)]
+struct Shared<T>(
+    #[cfg(feature = "send")] Arc<Mutex<T>>,
+    #[cfg(not(feature = "send"))] Rc<RefCell<T>>,
+);
+
+impl<T> Shared<T> {
+    fn new(val: T) -> Self {
+        #[cfg(feature = "send")]
+        {
+            Shared(Arc::new(Mutex::new(val)))
+        }
+        #[cfg(not(feature = "send"))]
+        {
+            Shared(Rc::new(RefCell::new(val)))
+        }
+    }
+
+    /// Safely access and mutate the inner value via a closure
+    fn map_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        #[cfg(feature = "send")]
+        {
+            let mut guard = self.0.lock().unwrap();
+            f(&mut *guard)
+        }
+        #[cfg(not(feature = "send"))]
+        {
+            let mut guard = self.0.borrow_mut();
+            f(&mut *guard)
+        }
+    }
+}
+
+impl<T: Clone> Shared<T> {
+    fn get_clone(&self) -> T {
+        #[cfg(feature = "send")]
+
+        {
+            self.0.lock().unwrap().clone()
+        }
+        #[cfg(not(feature = "send"))]
+        {
+            self.0.borrow().clone()
+        }
+    }
+}
+
+// --- Core Data Structures ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
     Save {
         name: String,
@@ -21,7 +83,6 @@ pub enum Action {
         description: String,
     },
 }
-
 
 const INSTRUCTION_STEP: u32 = 1_000;
 const MAX_HOOK_CALLS: u64 = 1_000;
@@ -49,18 +110,19 @@ fn configure_lua_limits(lua: &Lua) -> LuaResult<()> {
     Ok(())
 }
 
+// --- Runner Functions ---
 
 pub fn run_lua_with_data(
     code: &str,
     data: HashMap<String, Option<f32>>,
-    metadata: HashMap<String, String>
+    metadata: HashMap<String, String>,
 ) -> LuaResult<(Vec<Action>, String)> {
-    let actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(Vec::new()));
+    let actions = Shared::new(Vec::new());
     let lua = Lua::new();
 
     configure_lua_limits(&lua)?;
 
-    let stdout_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    let stdout_buf = Shared::new(String::new());
     let stdout_buf_clone = stdout_buf.clone();
 
     let print_fn = lua.create_function(move |_, args: Variadic<String>| {
@@ -72,7 +134,7 @@ pub fn run_lua_with_data(
             s.push_str(part);
         }
         s.push('\n');
-        stdout_buf_clone.borrow_mut().push_str(&s);
+        stdout_buf_clone.map_mut(|buf| buf.push_str(&s));
         Ok(())
     })?;
     lua.globals().set("print", print_fn)?;
@@ -81,7 +143,7 @@ pub fn run_lua_with_data(
         let stdout_buf_for_io = stdout_buf.clone();
         let io_write = lua.create_function(move |_, args: Variadic<String>| {
             for part in args.iter() {
-                stdout_buf_for_io.borrow_mut().push_str(part);
+                stdout_buf_for_io.map_mut(|buf| buf.push_str(part));
             }
             Ok(())
         })?;
@@ -91,7 +153,7 @@ pub fn run_lua_with_data(
                 let stdout_buf_for_stdout = stdout_buf.clone();
                 let write_fn = lua.create_function(move |_, args: Variadic<String>| {
                     for part in args.iter() {
-                        stdout_buf_for_stdout.borrow_mut().push_str(part);
+                        stdout_buf_for_stdout.map_mut(|buf| buf.push_str(part));
                     }
                     Ok(())
                 })?;
@@ -117,7 +179,7 @@ pub fn run_lua_with_data(
         Ok(()) => {
             let collected = drain_collected_actions(actions);
             let actions = keep_only_last_of_same_name(collected);
-            let output = stdout_buf.borrow().clone();
+            let output = stdout_buf.get_clone();
             Ok((actions, output))
         }
         Err(e) => Err(e),
@@ -127,14 +189,14 @@ pub fn run_lua_with_data(
 pub fn run_lua_with_data_daily(
     code: &str,
     data: HashMap<String, Vec<Option<f32>>>,
-    metadata: HashMap<String, String>
+    metadata: HashMap<String, String>,
 ) -> LuaResult<(Vec<Action>, String)> {
-    let actions: Rc<RefCell<Vec<Action>>> = Rc::new(RefCell::new(Vec::new()));
+    let actions = Shared::new(Vec::new());
     let lua = Lua::new();
 
     configure_lua_limits(&lua)?;
 
-    let stdout_buf: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    let stdout_buf = Shared::new(String::new());
     let stdout_buf_clone = stdout_buf.clone();
 
     let print_fn = lua.create_function(move |_, args: Variadic<String>| {
@@ -146,7 +208,7 @@ pub fn run_lua_with_data_daily(
             s.push_str(part);
         }
         s.push('\n');
-        stdout_buf_clone.borrow_mut().push_str(&s);
+        stdout_buf_clone.map_mut(|buf| buf.push_str(&s));
         Ok(())
     })?;
     lua.globals().set("print", print_fn)?;
@@ -155,7 +217,7 @@ pub fn run_lua_with_data_daily(
         let stdout_buf_for_io = stdout_buf.clone();
         let io_write = lua.create_function(move |_, args: Variadic<String>| {
             for part in args.iter() {
-                stdout_buf_for_io.borrow_mut().push_str(part);
+                stdout_buf_for_io.map_mut(|buf| buf.push_str(part));
             }
             Ok(())
         })?;
@@ -166,7 +228,7 @@ pub fn run_lua_with_data_daily(
                 let stdout_buf_for_stdout = stdout_buf.clone();
                 let write_fn = lua.create_function(move |_, args: Variadic<String>| {
                     for part in args.iter() {
-                        stdout_buf_for_stdout.borrow_mut().push_str(part);
+                        stdout_buf_for_stdout.map_mut(|buf| buf.push_str(part));
                     }
                     Ok(())
                 })?;
@@ -210,19 +272,21 @@ pub fn run_lua_with_data_daily(
 
     let collected = drain_collected_actions(actions);
     let actions = keep_only_last_of_same_name(collected);
-    let output = stdout_buf.borrow().clone();
+    let output = stdout_buf.get_clone();
     Ok((actions, output))
 }
 
-fn attach_action_functions(lua: &Lua, actions: Rc<RefCell<Vec<Action>>>, data: HashMap<String, Option<f32>>) -> LuaResult<()> {
+fn attach_action_functions(
+    lua: &Lua,
+    actions: Shared<Vec<Action>>,
+    data: HashMap<String, Option<f32>>,
+) -> LuaResult<()> {
     let globals = lua.globals();
 
     {
         let actions_clone = actions.clone();
         let save = lua.create_function(move |_, (name, value): (String, Option<f32>)| {
-            actions_clone
-                .borrow_mut()
-                .push(Action::Save { name, value });
+            actions_clone.map_mut(|a| a.push(Action::Save { name, value }));
             Ok(())
         })?;
         globals.set("save", save)?;
@@ -232,10 +296,12 @@ fn attach_action_functions(lua: &Lua, actions: Rc<RefCell<Vec<Action>>>, data: H
         let actions_clone = actions.clone();
         let write_parameter = lua.create_function(
             move |_, (parameter_name, new_value): (String, Option<f32>)| {
-                actions_clone.borrow_mut().push(Action::WriteParameter {
-                    parameter_name: parameter_name.clone(),
-                    new_value,
-                    old_value: data.get(&parameter_name).cloned().flatten()
+                actions_clone.map_mut(|a| {
+                    a.push(Action::WriteParameter {
+                        parameter_name: parameter_name.clone(),
+                        new_value,
+                        old_value: data.get(&parameter_name).cloned().flatten(),
+                    });
                 });
                 Ok(())
             },
@@ -247,9 +313,9 @@ fn attach_action_functions(lua: &Lua, actions: Rc<RefCell<Vec<Action>>>, data: H
         let actions_clone = actions;
         let create_case =
             lua.create_function(move |_, (title, description): (String, String)| {
-                actions_clone
-                    .borrow_mut()
-                    .push(Action::CreateCase { title, description });
+                actions_clone.map_mut(|a| {
+                    a.push(Action::CreateCase { title, description });
+                });
                 Ok(())
             })?;
         globals.set("create_case", create_case)?;
@@ -258,12 +324,11 @@ fn attach_action_functions(lua: &Lua, actions: Rc<RefCell<Vec<Action>>>, data: H
     Ok(())
 }
 
-fn drain_collected_actions(actions: Rc<RefCell<Vec<Action>>>) -> Vec<Action> {
+fn drain_collected_actions(actions: Shared<Vec<Action>>) -> Vec<Action> {
     let mut collected: Vec<Action> = Vec::new();
-    {
-        let mut a = actions.borrow_mut();
+    actions.map_mut(|a| {
         collected.extend(a.drain(..));
-    }
+    });
     collected
 }
 
@@ -294,6 +359,7 @@ fn keep_only_last_of_same_name(actions: Vec<Action>) -> Vec<Action> {
     result
 }
 
+// --- Tests ---
 
 #[cfg(test)]
 mod tests {
@@ -314,8 +380,14 @@ mod tests {
         for (i, (a, e)) in actual.into_iter().zip(expected.into_iter()).enumerate() {
             match (a, e) {
                 (
-                    Action::Save { name: an, value: av },
-                    Action::Save { name: en, value: ev },
+                    Action::Save {
+                        name: an,
+                        value: av,
+                    },
+                    Action::Save {
+                        name: en,
+                        value: ev,
+                    },
                 ) => {
                     assert_eq!(
                         an, en,
@@ -323,7 +395,8 @@ mod tests {
                         i, an, en
                     );
                     assert!(
-                        (av.is_none() && ev.is_none()) || (av.is_some() && ev.is_some() && av == ev),
+                        (av.is_none() && ev.is_none())
+                            || (av.is_some() && ev.is_some() && av == ev),
                         "mismatch at index {}: Save.value: got {:?}, expected {:?}",
                         i,
                         av,
@@ -349,14 +422,16 @@ mod tests {
                         i, ap, ep
                     );
                     assert!(
-                        (av.is_none() && ev.is_none()) || (av.is_some() && ev.is_some() && av == ev),
+                        (av.is_none() && ev.is_none())
+                            || (av.is_some() && ev.is_some() && av == ev),
                         "mismatch at index {}: WriteParameter.new_value: got {:?}, expected {:?}",
                         i,
                         av,
                         ev
                     );
                     assert!(
-                        (aov.is_none() && eov.is_none()) || (aov.is_some() && eov.is_some() && aov == eov),
+                        (aov.is_none() && eov.is_none())
+                            || (aov.is_some() && eov.is_some() && aov == eov),
                         "mismatch at index {}: WriteParameter.new_value: got {:?}, expected {:?}",
                         i,
                         aov,
@@ -417,9 +492,9 @@ mod tests {
                 value: Some(2.0),
             },
             Action::WriteParameter {
-                parameter_name:"p".to_string(),
-                new_value: Some(4.0), 
-                old_value: Some(2.0) 
+                parameter_name: "p".to_string(),
+                new_value: Some(4.0),
+                old_value: Some(2.0),
             },
             Action::CreateCase {
                 title: "title-1".to_string(),
@@ -502,14 +577,13 @@ mod tests {
 
         let data: HashMap<String, Option<f32>> = HashMap::new();
         let metadata: HashMap<String, String> = HashMap::new();
-        let (res, stdout) = run_lua_with_data(code, data, metadata).expect("should run lua and return (actions, stdout)");
+        let (res, stdout) = run_lua_with_data(code, data, metadata)
+            .expect("should run lua and return (actions, stdout)");
 
-        let expected = vec![
-            Action::Save {
-                name: "x".to_string(),
-                value: Some(5.5),
-            },
-        ];
+        let expected = vec![Action::Save {
+            name: "x".to_string(),
+            value: Some(5.5),
+        }];
         assert_actions_eq(res, expected);
 
         let expected_stdout = "hello\t123\nno-newlineafter\n";
